@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>字幕节奏与镜头边界校正台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🎬 字幕节奏与镜头边界校正台</div>
+  <div class="project-switch">
+    <select id="projectSelect" title="历史项目"></select>
+    <button id="newProjectBtn" type="button">新建项目</button>
+  </div>
+</header>
+
+<main>
+  <!-- 导入面板 -->
+  <section id="importPanel" class="panel">
+    <h2>1. 导入素材</h2>
+    <form id="importForm">
+      <div class="form-grid">
+        <label>项目名称
+          <input name="name" value="未命名项目" required>
+        </label>
+        <label>字幕文件（.srt / .vtt）
+          <input name="subtitle" type="file" accept=".srt,.vtt,text/vtt" required>
+        </label>
+        <label>镜头 JSON（含起止毫秒，可选）
+          <input name="shots_file" type="file" accept=".json,application/json">
+        </label>
+      </div>
+      <div class="form-grid settings">
+        <label>CPS 字符速率上限
+          <input name="cps_limit" type="number" step="0.1" min="0.1" value="21">
+        </label>
+        <label>最小间隔（毫秒）
+          <input name="min_gap_ms" type="number" step="1" min="0" value="40">
+        </label>
+        <label>镜头边界容差（毫秒）
+          <input name="tolerance_ms" type="number" step="1" min="0" value="200">
+        </label>
+      </div>
+      <div class="actions">
+        <button type="submit" class="primary">导入并分析</button>
+      </div>
+      <p class="hint">字素计数遵循 Unicode UAX #29 扩展字素簇；校正仅平移起点、保持时长不变。</p>
+    </form>
+  </section>
+
+  <!-- 工作台 -->
+  <section id="workspace" class="panel hidden">
+    <div class="ws-head">
+      <h2 id="projectTitle">项目</h2>
+      <div class="ws-actions">
+        <button id="adoptAllBtn" type="button" class="primary">采纳全部提案</button>
+        <a id="exportJson" class="btn" href="#" target="_blank">导出 JSON</a>
+        <a id="exportZip" class="btn" href="#">导出 JSON+SRT(ZIP)</a>
+        <a id="exportSrt" class="btn" href="#">导出 SRT</a>
+        <button id="deleteProjectBtn" type="button" class="danger">删除项目</button>
+      </div>
+    </div>
+
+    <form id="settingsForm" class="form-grid settings compact">
+      <label>CPS 上限
+        <input name="cps_limit" type="number" step="0.1" min="0.1">
+      </label>
+      <label>最小间隔 ms
+        <input name="min_gap_ms" type="number" step="1" min="0">
+      </label>
+      <label>边界容差 ms
+        <input name="tolerance_ms" type="number" step="1" min="0">
+      </label>
+      <button type="submit" class="primary">应用参数重新求解</button>
+    </form>
+
+    <div id="stats" class="stats"></div>
+    <div id="conflicts" class="conflicts"></div>
+
+    <div class="table-wrap">
+      <table id="cueTable">
+        <thead>
+          <tr>
+            <th>#</th><th>cue_id</th><th>原文（哈希）</th>
+            <th>原起→止 (ms)</th><th>时长</th><th>字素</th><th>CPS</th>
+            <th>检测</th><th>提案 起→止</th><th>Δ</th><th>状态/操作</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- 逐条文案修订 -->
+    <section id="textEditPanel" class="gap-review hidden">
+      <h3>文案修订</h3>
+      <p class="hint">保存时按导入同一套规则归一化：去除标签、折叠空白，
+        按 Unicode 扩展字素簇（UAX #29）重新计字素并更新 CPS；归一化后为空
+        不予保存。修订只改当前文案——cue_id、原时间、采纳与镜头留白结论不变，
+        导出 JSON 的原文哈希仍指向导入内容。可随时「恢复导入原文」。</p>
+      <div id="textEditInfo" class="text-edit-info"></div>
+      <textarea id="textEditInput" rows="3" spellcheck="false"
+                placeholder="输入修订后的文案"></textarea>
+      <div id="textEditPreview" class="hint"></div>
+      <div class="actions">
+        <button id="textEditSave" type="button" class="primary">保存修订</button>
+        <button id="textEditRestore" type="button">恢复导入原文</button>
+        <button id="textEditCancel" type="button">取消</button>
+      </div>
+      <p class="hint" id="textEditHint"></p>
+    </section>
+
+    <!-- 镜头留白审阅 -->
+    <section id="gapReviewPanel" class="gap-review hidden">
+      <h3>镜头留白审阅</h3>
+      <p class="hint">按生效时间轴（已采纳 → 提案 → 原值）逐镜头计算未被字幕覆盖的半开区间；
+        相接/重叠的镜头分别审阅。采纳、撤销或重算参数后：边界未变的结论保留，变化的区间回到待审。</p>
+      <div id="gapStats" class="stats"></div>
+      <div id="gapList"></div>
+    </section>
+
+    <!-- 交付字幕核验 -->
+    <section id="deliveryVerifyPanel" class="gap-review">
+      <h3>交付字幕核验</h3>
+      <p class="hint">上传合作方回传的 SRT / WebVTT：服务端按项目当前生效时间轴
+        （已采纳 → 提案 → 原值）逐条对照。交付稿允许重编号、插删行、重复文案，
+        按「保持顺序、同文案匹配最多、时间偏差之和最小」配对；存在等优配对且会
+        改变某行结论时，相关行列为<strong>待确认</strong>，不自动判缺失/时间不符。
+        核验结果不落库，不影响采纳、留白结论与 JSON/SRT/ZIP 导出。
+        结论以<strong>提交动作</strong>为稿件切换边界：页面只记住最近一次
+        点「上传并核验」提交的稿件——之后只在文件框改选另一份而不提交，
+        并不会切换稿件；清空文件框也不影响，只要已提交稿件仍可读取即可。
+        结论与当前生效时间轴绑定：参数重算、采纳或撤销改变了生效轴后，旧结论
+        立即作废——页面自动用<strong>最近一次已提交</strong>的稿件按新生效轴
+        重新核验，不会把文件框里改选未提交稿件的结论当作旧稿的；改选的稿件
+        只有提交后才会取代旧稿。稿件已不可读时提示重新上传；仅调 CPS 上限等
+        不改变生效轴的修改会保留结论。另一标签页改轴导致
+        本页详情过期时，页面会先同步最新项目详情：结论仍有效则直接展示，
+        已过期才用已提交稿件按新轴重核（自动重核有次数上限，超限、详情刷新失败
+        或稿件不可读时停止并提示重传）。切换项目后仅显示当前
+        项目最近一次提交的结果。</p>
+      <form id="deliveryVerifyForm" class="delivery-form">
+        <input name="delivery" type="file" accept=".srt,.vtt,text/vtt" required>
+        <button type="submit" class="primary">上传并核验</button>
+        <span id="deliveryName" class="muted"></span>
+      </form>
+      <div id="verifyStats" class="stats"></div>
+      <div class="table-wrap">
+        <table id="verifyTable">
+          <thead>
+            <tr>
+              <th>结论</th><th>生效轴 #</th><th>生效轴时间（ms）</th>
+              <th>交付稿 #</th><th>交付稿时间（ms）</th><th>Δ 起 / Δ 止</th>
+              <th>文案</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
