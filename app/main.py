@@ -53,14 +53,15 @@ class GapReviewIn(BaseModel):
 
 
 class TextEditIn(BaseModel):
-    """逐条文案修订。base_text 为页面打开编辑时看到的当前文案：服务端在
-    写锁内比对，不一致即另一标签页已先改过 → 409 拒绝覆盖并回传最新文案。"""
+    """逐条文案修订。base_version 为页面打开编辑时该条的修订版本（详情中的
+    text_version）：服务端在写锁内比对，不一致即另一标签页已先改过 → 409
+    拒绝覆盖并回传最新文案与版本，页面据以重编辑。"""
     text: str
-    base_text: str
+    base_version: int
 
 
 class TextRestoreIn(BaseModel):
-    base_text: str
+    base_version: int
 
 
 # ---------- 序列化 ----------
@@ -78,6 +79,7 @@ def _cue_row(row) -> dict:
         "edited": edited,
         "graphemes": db.current_graphemes(row),
         "raw_hash": row["raw_hash"],
+        "text_version": row["text_version"],
         "adopted_start_ms": row["new_start_ms"],
         "adopted_end_ms": row["new_end_ms"],
         "adopted": row["new_start_ms"] is not None,
@@ -190,6 +192,7 @@ def _recompute_from(conn, pid: int, prow, cue_db_rows, shots, parsed) -> dict:
         rep.adopted_end_ms = dbr["new_end_ms"]
         rep.edited = dbr["edited_text"] is not None
         rep.imported_text = dbr["text"]
+        rep.text_version = dbr["text_version"]
     return {
         "id": prow["id"],
         "name": prow["name"],
@@ -376,20 +379,21 @@ def revert_adoption(pid: int, cue_uid: int):
 
 # ---------- 逐条文案修订 ----------
 
-def _check_text_base(conn, pid: int, cue_uid: int, base_text: str):
-    """写锁内读取目标 cue 并校验 base_text（旧页面提交识别）。
+def _check_text_base(conn, pid: int, cue_uid: int, base_version: int):
+    """写锁内读取目标 cue 并校验 base_version（旧页面提交识别）。
 
-    另一标签页已先改过该条文案时，当前文案与页面编辑基准不一致 → 409
-    拒绝覆盖，detail 携带最新文案供页面展示；cue 不存在 → 400。
+    修订版本是单调的编辑基准：另一标签页改过该条文案（哪怕「先改又恢复」
+    使当前文案恰好回到旧值）版本都已推进，基准不符 → 409 拒绝覆盖，
+    detail 携带最新文案与最新版本供页面重编辑；cue 不存在 → 400。
     """
     row = db.get_cue(conn, pid, cue_uid)
     if row is None:
         raise HTTPException(400, "cue 不存在")
-    current = db.current_text(row)
-    if current != base_text:
+    if row["text_version"] != base_version:
         raise HTTPException(status_code=409, detail={
             "message": "该条文案已在别处被修改，请基于最新文案重新编辑",
-            "current_text": current,
+            "current_text": db.current_text(row),
+            "text_version": row["text_version"],
             "edited": row["edited_text"] is not None,
         })
     return row
@@ -400,10 +404,15 @@ def edit_cue_text(pid: int, cue_uid: int, body: TextEditIn):
     """保存一条文案修订。
 
     归一化沿用导入同一套规则（去标签、折叠空白、UAX #29 字素簇计数），
-    归一化后为空 → 400 不写库；cue 不存在 → 400；base 不符 → 409。
+    归一化后为空 → 400 不写库；cue 不存在 → 400；base 版本不符 → 409。
     写路径与参数更新 / 采纳共用同一事务边界：先取写锁再读最新状态，
     任一步失败整体回滚，不留半更新。修订只改当前文案：cue_id、原时间、
     采纳与镜头留白结论不变，原文哈希仍指向导入内容。
+
+    版本推进裁决：只有真正改变当前文案的保存才写库并推进 text_version
+    ——归一化后与当前文案一致的保存是幂等空操作，成功返回但不推进版本，
+    以免无变化的提交误拒其他页面基于同一文案的有效编辑；而任何真实变化
+    （含「改为与导入原文一致」的恢复式保存）都推进版本，旧页提交必被 409。
     """
     new_text = visible_text(body.text)
     if not new_text:
@@ -413,8 +422,10 @@ def edit_cue_text(pid: int, cue_uid: int, body: TextEditIn):
     with db.get_conn(write=True) as conn:
         if db.get_project(conn, pid) is None:
             raise HTTPException(404, "项目不存在")
-        row = _check_text_base(conn, pid, cue_uid, body.base_text)
-        if new_text == row["text"]:
+        row = _check_text_base(conn, pid, cue_uid, body.base_version)
+        if new_text == db.current_text(row):
+            pass  # 归一化后与当前文案一致：幂等成功，不写库、不推进版本
+        elif new_text == row["text"]:
             # 修订稿与导入原文一致：等同恢复导入原文，不留修订标记
             db.clear_cue_text_edit(conn, pid, cue_uid)
         else:
@@ -424,16 +435,18 @@ def edit_cue_text(pid: int, cue_uid: int, body: TextEditIn):
 
 @app.post("/api/projects/{pid}/cues/{cue_uid}/text/restore")
 def restore_cue_text(pid: int, cue_uid: int, body: TextRestoreIn):
-    """恢复导入原文：清除该条修订稿（未修订时幂等成功）。
+    """恢复导入原文：清除该条修订稿（未修订时幂等成功，不推进版本）。
 
-    与修订同一套旧页面识别：base_text 不符 → 409 并回传最新文案，
-    不会把另一标签页的新修订覆盖回导入原文。
+    与修订同一套旧页面识别：base_version 不符 → 409 并回传最新文案与
+    版本，不会把另一标签页的新修订覆盖回导入原文。确有修订稿的恢复
+    改变当前文案 → 写库并推进版本。
     """
     with db.get_conn(write=True) as conn:
         if db.get_project(conn, pid) is None:
             raise HTTPException(404, "项目不存在")
-        _check_text_base(conn, pid, cue_uid, body.base_text)
-        db.clear_cue_text_edit(conn, pid, cue_uid)
+        row = _check_text_base(conn, pid, cue_uid, body.base_version)
+        if row["edited_text"] is not None:
+            db.clear_cue_text_edit(conn, pid, cue_uid)
         return _recompute(conn, pid)
 
 

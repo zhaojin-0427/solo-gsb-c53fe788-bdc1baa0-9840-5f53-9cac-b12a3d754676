@@ -30,6 +30,7 @@ class CueReport:
     adopted_end_ms: int | None = None
     edited: bool = False                 # 文案是否被修订过
     imported_text: str = ""              # 导入原文（可见文本）
+    text_version: int = 0                # 单调修订版本（编辑基准，由调用方填充）
 
 
 @dataclass
