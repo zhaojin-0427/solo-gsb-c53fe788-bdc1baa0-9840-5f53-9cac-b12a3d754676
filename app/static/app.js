@@ -14,8 +14,9 @@ const state = {
   // 读取快照，绝不读取文件框当前值，避免把改选未提交稿的结论当成旧稿的。
   verifySnapshot: null,  // {file, name, projectId} 最近一次已提交的稿件
   verifyAutoInFlight: false,  // 同一生效轴上的自动重核是否在途（防重复触发）
-  // 文案修订：{uid, baseText}。baseText 是打开编辑时该条的当前文案，保存 /
-  // 恢复时随请求上送，服务端据此识别旧页面提交（另一标签页先改过则 409）。
+  // 文案修订：{uid, baseText, baseVersion}。baseText / baseVersion 是打开
+  // 编辑时该条的当前文案与其单调修订版本，保存 / 恢复时随请求上送，服务端
+  // 据此识别旧页面提交（另一标签页先改过则 409，并回传最新文案与版本）。
   textEditing: null,
 };
 
@@ -64,7 +65,8 @@ async function api(path, opts = {}) {
       const body = await res.json();
       detail = body.detail ?? null;
       // detail 可能是字符串，也可能是结构化对象（如文案修订 409 冲突
-      // 携带 {message, current_text, edited}，供页面展示最新文案）
+      // 携带 {message, current_text, edited, current_version}，供页面
+      // 展示最新文案并重新形成提交基准）
       if (typeof detail === "string") msg = detail;
       else if (detail && detail.message) msg = detail.message;
     } catch (_) {}
@@ -390,9 +392,11 @@ function renderDeliveryVerify() {
 
 // ---------- 逐条文案修订 ----------
 // 每行「修订」打开表格外侧的独立编辑面板（render 全量重建表格时不受影响，
-// 草稿不丢）。保存 / 恢复都携带打开编辑时的当前文案作为 base_text：服务端
-// 在写锁内比对，若另一标签页已先改过则 409 拒绝覆盖并回传最新文案——页面
-// 把最新文案载入编辑框并提示，绝不静默覆盖。恢复导入原文即清除修订稿。
+// 草稿不丢）。保存 / 恢复都携带打开编辑时的当前文案与单调修订版本作为
+// base_text / base_version：服务端在写锁内以版本为权威判据比对，若另一
+// 标签页已先改过（哪怕改后又恢复、文字看起来没变）则 409 拒绝覆盖并回传
+// 最新文案与版本——页面把最新文案载入编辑框、基准更新为最新版本并提示，
+// 绝不静默覆盖。恢复导入原文即清除修订稿。
 const _graphemeSegmenter = (typeof Intl !== "undefined" && Intl.Segmenter)
   ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
 
@@ -421,7 +425,10 @@ function closeTextEdit() {
 function openTextEdit(uid) {
   const c = state.project && state.project.analysis.cues.find(x => x.uid === uid);
   if (!c) return;
-  state.textEditing = { uid, baseText: c.text };
+  // 编辑基准 = 打开时该条的当前文案 + 单调修订版本。服务端在写锁内以版本
+  // 为权威判据（辅以文字比对）：即使别处「改成 Y 又恢复 X」使文字回到原值，
+  // 版本也已推进，旧页面仍会被 409 挡下。
+  state.textEditing = { uid, baseText: c.text, baseVersion: c.text_version };
   $("#textEditInput").value = c.text;
   $("#textEditHint").textContent = "";
   $("#textEditPanel").classList.remove("hidden");
@@ -440,7 +447,8 @@ function renderTextEditInfo() {
     : `<span class="pill proposed">未修订</span>`;
   $("#textEditInfo").innerHTML = `
     <div><b>cue ${esc(c.cue_id)}</b>（#${c.ord}，原时间 ${c.start_ms} → ${c.end_ms} ms，
-      时长 ${c.duration_ms} ms）${editedNote}</div>
+      时长 ${c.duration_ms} ms）${editedNote}
+      <span class="muted">修订版本 v${c.text_version}</span></div>
     <div class="hash">导入原文：${esc(c.imported_text)}
       （sha256:${c.raw_hash.slice(0, 16)}…）</div>
     <div class="hash">库中当前文案：${esc(c.text)}　字素 ${c.graphemes} ·
@@ -466,14 +474,16 @@ function updateTextEditPreview() {
   el.textContent = `草稿字素 ${n} · 预计 CPS ${cpsTxt}${over}（以服务端保存结果为准）`;
 }
 
-// 409：另一标签页已先改过该条。拒绝覆盖——把服务端回传的最新文案载入
-// 编辑框、更新编辑基准，并刷新项目详情；用户基于最新文案重新编辑。
+// 409：另一标签页已先改过该条（版本不符；即便别处改后又恢复使文字看起来
+// 相同也一样）。拒绝覆盖——把服务端回传的最新文案载入编辑框、把文字与
+// 版本基准一并更新，并刷新项目详情；用户基于最新文案重新编辑。
 function handleTextEditConflict(e) {
   const d = e.detail;
   if (e.status !== 409 || !d || typeof d !== "object") return false;
   const ed = state.textEditing;
   if (ed) {
     ed.baseText = d.current_text;
+    ed.baseVersion = d.current_version;
     $("#textEditInput").value = d.current_text;
     $("#textEditHint").textContent =
       "该条文案已在别处被修改，编辑框已载入最新文案，请在此基础上重新编辑后再保存。";
@@ -492,7 +502,8 @@ async function saveTextEdit() {
     state.project = await api(`/api/projects/${pid}/cues/${ed.uid}/text`, {
       method: "PUT",
       body: JSON.stringify({ text: $("#textEditInput").value,
-                             base_text: ed.baseText }),
+                             base_text: ed.baseText,
+                             base_version: ed.baseVersion }),
     });
     toast("文案修订已保存");
     closeTextEdit();
@@ -512,7 +523,8 @@ async function restoreTextEdit() {
     state.project = await api(
       `/api/projects/${pid}/cues/${ed.uid}/text/restore`, {
         method: "POST",
-        body: JSON.stringify({ base_text: ed.baseText }),
+        body: JSON.stringify({ base_text: ed.baseText,
+                               base_version: ed.baseVersion }),
       });
     toast("已恢复导入原文");
     closeTextEdit();

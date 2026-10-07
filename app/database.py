@@ -4,7 +4,14 @@
 文案修订：cues.edited_text / edited_graphemes 为修订稿（归一化后的可见文本
 与其字素数），NULL 表示未修订——当前文案即 COALESCE(edited_text, text)。
 导入列（text / graphemes / raw_hash）自导入后永不改写，恢复导入原文 =
-把修订列置回 NULL。"""
+把修订列置回 NULL。
+
+修订版本：cues.text_version 为每条 cue 单调递增的修订版本号（导入时 0），
+只有「当前文案真正改变」的已提交写事务才 +1——归一化后与当前文案相同的
+保存、未修订时的幂等恢复、以及任何回滚 / 拒绝的请求都不推进。保存与恢复
+请求上送打开编辑时拿到的 base_version，写锁内版本不符即 409，杜绝
+「甲打开 X，乙改成 Y 又恢复 X，甲仍以 X 为基准覆盖成 Z」这类仅比对文字
+无法识别的旧页覆盖。"""
 from __future__ import annotations
 
 import os
@@ -38,7 +45,10 @@ CREATE TABLE IF NOT EXISTS cues (
     graphemes    INTEGER NOT NULL,
     raw_hash     TEXT NOT NULL,
     edited_text  TEXT,
-    edited_graphemes INTEGER
+    edited_graphemes INTEGER,
+    -- 单调修订版本：导入为 0，仅当前文案真正改变的已提交写事务 +1。
+    -- 归一化后同文案保存 / 未修订时幂等恢复 / 失败事务都不推进。
+    text_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS shots (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,12 +127,19 @@ def init_db() -> None:
     conn = _connect()
     try:
         conn.executescript(_SCHEMA)
-        # 旧库迁移：逐条文案修订列（已存在的库按新 schema 不会重建表）
+        # 旧库迁移：逐条文案修订列与单调修订版本列（已存在的库按新
+        # schema 不会重建表）。旧库已有行的 text_version 取默认值 0，
+        # 表示「当前文案的修订代次为导入代」，此后仍可正常修订并从 1 起推进。
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(cues)")}
         if "edited_text" not in cols:
             conn.execute("ALTER TABLE cues ADD COLUMN edited_text TEXT")
         if "edited_graphemes" not in cols:
             conn.execute("ALTER TABLE cues ADD COLUMN edited_graphemes INTEGER")
+        if "text_version" not in cols:
+            conn.execute(
+                "ALTER TABLE cues ADD COLUMN text_version"
+                " INTEGER NOT NULL DEFAULT 0"
+            )
     finally:
         conn.close()
 
@@ -235,19 +252,26 @@ def update_cue_text(
     conn: sqlite3.Connection, pid: int, cue_uid: int,
     edited_text: str, edited_graphemes: int,
 ) -> None:
-    """落一条修订稿（已按导入同一套规则归一化）。导入列不改写。"""
+    """落一条修订稿（已按导入同一套规则归一化）。导入列不改写。
+
+    当前文案必然改变（调用方已排除归一化后与当前文案相同的情况），
+    text_version 在同一写事务内 +1。"""
     conn.execute(
-        "UPDATE cues SET edited_text=?, edited_graphemes=?"
-        " WHERE project_id=? AND id=?",
+        "UPDATE cues SET edited_text=?, edited_graphemes=?,"
+        " text_version=text_version+1 WHERE project_id=? AND id=?",
         (edited_text, edited_graphemes, pid, cue_uid),
     )
 
 
-def clear_cue_text_edit(conn: sqlite3.Connection, pid: int, cue_uid: int) -> None:
-    """恢复导入原文：清除修订稿，当前文案回落到导入列。"""
+def restore_cue_text(conn: sqlite3.Connection, pid: int, cue_uid: int) -> None:
+    """恢复导入原文：清除修订稿，当前文案回落到导入列。
+
+    仅用于当前存在修订稿的 cue（未修订时的幂等恢复根本不调用本函数，
+    版本不推进）；清除后当前文案必然改变，text_version 在同一写事务内 +1。
+    """
     conn.execute(
-        "UPDATE cues SET edited_text=NULL, edited_graphemes=NULL"
-        " WHERE project_id=? AND id=?",
+        "UPDATE cues SET edited_text=NULL, edited_graphemes=NULL,"
+        " text_version=text_version+1 WHERE project_id=? AND id=?",
         (pid, cue_uid),
     )
 

@@ -1,12 +1,16 @@
 // 逐条文案修订的前端回归（node 直接运行，无框架）：
 // 用最小 DOM/fetch 桩在 vm 中加载 app/static/app.js，验证——
-// - 行内「修订」打开独立编辑面板：预填当前文案，render 全量重建表格时
-//   编辑框草稿不被覆盖（面板在表格之外）；
-// - 保存携带 text + base_text（打开编辑时的当前文案）；成功后关闭面板；
+// - 行内「修订」打开独立编辑面板：预填当前文案与单调修订版本，render
+//   全量重建表格时编辑框草稿不被覆盖（面板在表格之外）；
+// - 保存携带 text + base_text + base_version（打开编辑时的当前文案/版本）；
+//   成功后关闭面板；
 // - 另一标签页先改过（409）：拒绝覆盖，编辑框载入服务端回传的最新文案、
-//   编辑基准同步更新，提示用户；随后再次保存以最新文案为 base 才成功——
-//   不会用旧 base 覆盖别人的修订；
-// - 恢复导入原文走 restore 端点，同样携带 base_text、同样处理 409；
+//   编辑基准（文字 + 版本）同步更新，提示用户；随后再次保存以最新文案 /
+//   版本为 base 才成功——不会用旧 base 覆盖别人的修订；
+// - 旧页覆盖核心场景：别处「先存 Y 再恢复 X」使文字回到 X，但版本已推进，
+//   本页仍以 v0 保存 → 409 载入 X/最新版本，重编辑以新版本提交才成功；
+// - 恢复导入原文走 restore 端点，同样携带 base_text / base_version、同样
+//   处理 409；
 // - 空白稿被 400 拒绝时面板保持打开、不关闭不丢草稿；
 // - 切换/关闭项目（render 无项目）时编辑面板一并关闭。
 "use strict";
@@ -102,7 +106,7 @@ function cue(uid, text, extra = {}) {
   return {
     uid, cue_id: String(uid), ord: uid,
     start_ms: 0, end_ms: 1000, duration_ms: 1000,
-    text, imported_text: text, edited: false,
+    text, imported_text: text, edited: false, text_version: 0,
     graphemes: [...text].length, raw_hash: "ab".repeat(32),
     cps: 1, cps_ok: true, overlap_with: null, cross_shot: false,
     proposal_start_ms: 0, proposal_end_ms: 1000,
@@ -146,26 +150,33 @@ async function test_open_prefills_and_render_keeps_draft() {
   app.openTextEdit(11);
   assert.strictEqual(editInput().value, "甲", "打开时应预填当前文案");
   assert.strictEqual(state.textEditing.baseText, "甲");
+  assert.strictEqual(state.textEditing.baseVersion, 0,
+                     "打开时应记下单调修订版本作为基准");
   // 用户输入草稿后，任意 render（如参数重算回来）不得覆盖草稿
   editInput().value = "甲（草稿）";
   app.render();
   assert.strictEqual(editInput().value, "甲（草稿）",
                      "render 不得覆盖编辑框草稿");
+  assert.strictEqual(state.textEditing.baseVersion, 0,
+                     "render 不得改动提交基准版本");
   app.closeTextEdit();
   console.log("frontend open prefill + render keeps draft ok");
 }
 
 async function test_save_success_closes() {
-  state.project = proj(1, [cue(11, "甲"), cue(12, "乙")]);
+  state.project = proj(1, [cue(11, "甲", { text_version: 2 }), cue(12, "乙")]);
   app.openTextEdit(11);
+  assert.strictEqual(state.textEditing.baseVersion, 2);
   editInput().value = "甲（修订）";
   const p = app.saveTextEdit();
   const req = popPending("/cues/11/text", "PUT");
   const body = JSON.parse(req.opts.body);
   assert.strictEqual(body.text, "甲（修订）");
   assert.strictEqual(body.base_text, "甲", "保存须携带编辑基准 base_text");
+  assert.strictEqual(body.base_version, 2, "保存须携带编辑基准 base_version");
   respondJson(req, proj(1, [cue(11, "甲（修订）",
-                                 { imported_text: "甲", edited: true }),
+                                 { imported_text: "甲", edited: true,
+                                   text_version: 3 }),
                             cue(12, "乙")], "h2"));
   await p; await flush();
   assert.strictEqual(state.textEditing, null, "保存成功应关闭面板");
@@ -174,72 +185,126 @@ async function test_save_success_closes() {
 }
 
 async function test_save_409_loads_latest_text() {
-  // 核心回归：另一标签页先把「甲」改为「A稿」；本页仍基于「甲」保存 →
-  // 409，编辑框必须载入最新文案「A稿」，且不得用旧 base 覆盖
+  // 核心回归：另一标签页先把「甲」改为「A稿」；本页仍基于「甲 v0」保存 →
+  // 409，编辑框必须载入最新文案「A稿」，基准更新到 v1，且不得用旧 base
+  // 覆盖
   state.project = proj(1, [cue(11, "甲"), cue(12, "乙")]);
   app.openTextEdit(11);
   editInput().value = "B稿";
   const p = app.saveTextEdit();
-  respondJson(popPending("/cues/11/text", "PUT"), {
+  const putReq = popPending("/cues/11/text", "PUT");
+  assert.strictEqual(JSON.parse(putReq.opts.body).base_version, 0);
+  respondJson(putReq, {
     detail: { message: "该条文案已在别处被修改，请基于最新文案重新编辑",
-              current_text: "A稿", edited: true },
+              current_text: "A稿", edited: true, current_version: 1 },
   }, false, 409);
   await p; await flush();
   assert.ok(state.textEditing, "409 后面板应保持打开");
   assert.strictEqual(editInput().value, "A稿",
                      "409 后编辑框必须显示最新文案");
   assert.strictEqual(state.textEditing.baseText, "A稿",
-                     "编辑基准须同步到最新文案");
+                     "编辑基准文字须同步到最新文案");
+  assert.strictEqual(state.textEditing.baseVersion, 1,
+                     "编辑基准版本须同步到最新版本");
   assert.ok(editHint().textContent.includes("最新文案"),
             "应提示已载入最新文案");
   // 详情刷新请求（refreshAfterConflict）：回最新项目
   respondJson(popPending("/api/projects/1", "GET"),
-              proj(1, [cue(11, "A稿", { imported_text: "甲", edited: true }),
+              proj(1, [cue(11, "A稿", { imported_text: "甲", edited: true,
+                                        text_version: 1 }),
                        cue(12, "乙")], "h3"));
   await flush();
-  // 用户在最新文案基础上继续编辑并保存：base 必须是「A稿」
+  // 用户在最新文案基础上继续编辑并保存：base 必须是「A稿 v1」
   editInput().value = "B稿";
   const p2 = app.saveTextEdit();
   const body = lastPutBody();
   assert.strictEqual(body.base_text, "A稿",
                      "再次保存必须以最新文案为 base，不得覆盖他人修订");
+  assert.strictEqual(body.base_version, 1,
+                     "再次保存必须以最新版本为 base_version");
   assert.strictEqual(body.text, "B稿");
   respondJson(popPending("/cues/11/text", "PUT"),
-              proj(1, [cue(11, "B稿", { imported_text: "甲", edited: true }),
+              proj(1, [cue(11, "B稿", { imported_text: "甲", edited: true,
+                                        text_version: 2 }),
                        cue(12, "乙")], "h4"));
   await p2; await flush();
   assert.strictEqual(state.textEditing, null, "二次保存成功应关闭面板");
   console.log("frontend save 409 -> show latest text + rebase ok");
 }
 
+async function test_save_after_restore_elsewhere_409_then_reedit() {
+  // 旧页覆盖核心场景的前端形态：打开时为「甲 v0」，另一标签页先存 Y(v1)
+  // 再恢复 X(v2)，文字回到「甲」但版本已推进。本页仍以 v0 保存 Z → 409，
+  // 必须载入「甲」并把基准更新到 v2；随后以 v2 重编辑才成功。
+  state.project = proj(1, [cue(11, "甲"), cue(12, "乙")]);
+  app.openTextEdit(11);
+  editInput().value = "Z稿";
+  const p = app.saveTextEdit();
+  respondJson(popPending("/cues/11/text", "PUT"), {
+    detail: { message: "该条文案已在别处被修改，请基于最新文案重新编辑",
+              current_text: "甲", edited: false, current_version: 2 },
+  }, false, 409);
+  await p; await flush();
+  assert.strictEqual(editInput().value, "甲",
+                     "409 后即使文字相同也必须载入服务端最新文案");
+  assert.strictEqual(state.textEditing.baseVersion, 2,
+                     "文字相同但版本过期：基准必须更新到 v2");
+  respondJson(popPending("/api/projects/1", "GET"),
+              proj(1, [cue(11, "甲", { text_version: 2 }), cue(12, "乙")],
+                   "h3b"));
+  await flush();
+  // 以最新基准重编辑
+  editInput().value = "Z稿";
+  const p2 = app.saveTextEdit();
+  const body = lastPutBody();
+  assert.strictEqual(body.base_text, "甲");
+  assert.strictEqual(body.base_version, 2, "重编辑必须携带 v2");
+  respondJson(popPending("/cues/11/text", "PUT"),
+              proj(1, [cue(11, "Z稿", { imported_text: "甲", edited: true,
+                                        text_version: 3 }),
+                       cue(12, "乙")], "h4b"));
+  await p2; await flush();
+  assert.strictEqual(state.textEditing, null, "重编辑成功应关闭面板");
+  console.log("frontend save->restore elsewhere 409 -> rebase + reedit ok");
+}
+
 async function test_restore_and_409() {
-  state.project = proj(1, [cue(11, "A稿", { imported_text: "甲", edited: true }),
+  state.project = proj(1, [cue(11, "A稿", { imported_text: "甲", edited: true,
+                                            text_version: 1 }),
                            cue(12, "乙")]);
   app.openTextEdit(11);
   const p = app.restoreTextEdit();
   const req = popPending("/cues/11/text/restore", "POST");
-  assert.strictEqual(JSON.parse(req.opts.body).base_text, "A稿",
+  const body = JSON.parse(req.opts.body);
+  assert.strictEqual(body.base_text, "A稿",
                      "恢复须携带编辑基准 base_text");
-  respondJson(req, proj(1, [cue(11, "甲"), cue(12, "乙")], "h5"));
+  assert.strictEqual(body.base_version, 1,
+                     "恢复须携带编辑基准 base_version");
+  respondJson(req, proj(1, [cue(11, "甲", { text_version: 2 }), cue(12, "乙")],
+                        "h5"));
   await p; await flush();
   assert.strictEqual(state.textEditing, null, "恢复成功应关闭面板");
   assert.strictEqual(state.project.analysis.cues[0].text, "甲");
 
   // 恢复时另一标签页已先改 → 409：不得把别人的修订覆盖回原文
-  state.project = proj(1, [cue(11, "B稿", { imported_text: "甲", edited: true }),
+  state.project = proj(1, [cue(11, "B稿", { imported_text: "甲", edited: true,
+                                            text_version: 3 }),
                            cue(12, "乙")]);
   app.openTextEdit(11);
   const p2 = app.restoreTextEdit();
   respondJson(popPending("/cues/11/text/restore", "POST"), {
     detail: { message: "该条文案已在别处被修改，请基于最新文案重新编辑",
-              current_text: "C稿", edited: true },
+              current_text: "C稿", edited: true, current_version: 4 },
   }, false, 409);
   await p2; await flush();
   assert.ok(state.textEditing, "409 后面板应保持打开");
   assert.strictEqual(editInput().value, "C稿",
                      "恢复 409 同样须显示最新文案");
+  assert.strictEqual(state.textEditing.baseVersion, 4,
+                     "恢复 409 同样须把基准更新到最新版本");
   respondJson(popPending("/api/projects/1", "GET"),
-              proj(1, [cue(11, "C稿", { imported_text: "甲", edited: true }),
+              proj(1, [cue(11, "C稿", { imported_text: "甲", edited: true,
+                                        text_version: 4 }),
                        cue(12, "乙")], "h6"));
   await flush();
   app.closeTextEdit();
@@ -285,6 +350,7 @@ async function main() {
   await test_open_prefills_and_render_keeps_draft();
   await test_save_success_closes();
   await test_save_409_loads_latest_text();
+  await test_save_after_restore_elsewhere_409_then_reedit();
   await test_restore_and_409();
   await test_blank_rejected_keeps_panel();
   await test_panel_closed_when_project_gone();
